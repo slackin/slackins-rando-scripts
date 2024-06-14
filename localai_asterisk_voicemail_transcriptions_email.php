@@ -18,7 +18,7 @@ function processFile($wav_file, $txt_file, $sender_email, $sender_name, $email, 
         $ch = curl_init();
 
         // Set the URL
-        curl_setopt($ch, CURLOPT_URL, 'http://10.42.1.33:8080/v1/audio/transcriptions');
+        curl_setopt($ch, CURLOPT_URL, 'http://your.localai.server:8080/v1/audio/transcriptions');
 
         // Set the request to POST
         curl_setopt($ch, CURLOPT_POST, 1);
@@ -98,8 +98,8 @@ function processFile($wav_file, $txt_file, $sender_email, $sender_name, $email, 
 
 $directory = "/var/spool/asterisk/voicemail/default/3520/INBOX";
 $destDirectory = "/var/spool/asterisk/voicemail/default/3520/PROCESSED";
-$sender_email = "asterisk@rayline.net";
-$email = "justin@colonialpool.co";
+$sender_email = "someone@somewhere.net";
+$email = "someone_else@somewhere.com";
 $sender_name = "Asterisk Voicemail";
 
 // Start an infinite loop to continuously monitor the directory
