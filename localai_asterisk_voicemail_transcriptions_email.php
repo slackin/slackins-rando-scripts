@@ -1,6 +1,6 @@
 <?php
 
-function processFile($wav_file, $txt_file, $sender_email, $sender_name, $email, $txtData)
+function processFile($wav_file, $txt_file, $sender_email, $sender_name, $email, $cid_name, $cid_num)
 {
     // Fork a new process
     $pid = pcntl_fork();
@@ -18,7 +18,7 @@ function processFile($wav_file, $txt_file, $sender_email, $sender_name, $email, 
         $ch = curl_init();
 
         // Set the URL
-        curl_setopt($ch, CURLOPT_URL, 'http://your.localai.server:8080/v1/audio/transcriptions');
+        curl_setopt($ch, CURLOPT_URL, 'http://10.42.1.33:8080/v1/audio/transcriptions');
 
         // Set the request to POST
         curl_setopt($ch, CURLOPT_POST, 1);
@@ -42,65 +42,105 @@ function processFile($wav_file, $txt_file, $sender_email, $sender_name, $email, 
         curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
 
+        echo "Transcribing voicemail...\n";
+        // Record the start time
+        $start_time = microtime(true);
+
         // Execute the cURL request
         $response = curl_exec($ch);
 
+        // Record the end time
+        $end_time = microtime(true);
+
+        // Calculate the difference (this is the time it took for the cURL command to finish)
+        $execution_time = $end_time - $start_time;
+
+        echo "cURL execution time: $execution_time seconds.\n";
+
+        echo "Transcription complete.\n";
         // Close the cURL session
         curl_close($ch);
-        
+
         // Decode the JSON response
         $json_response = json_decode($response, true);
 
         // Get the 'text' field from the JSON data
         $transcription_output = $json_response['text'];
 
-        // This part is left as a placeholder as PHP doesn't have a built-in way to execute curl commands
-        //$transcription_output = $response;
+        // Read the files
+        $wavFileContent = file_get_contents($wav_file);
+        $txtFileContent = file_get_contents($txt_file);
 
-        // Encode the .wav file in Base64
-        $wav_base64 = base64_encode(file_get_contents($wav_file));
+        // Generate a boundary string
+        $boundary = md5(uniqid(time()));
 
-        // Get the file type and file name
-        $file_type = mime_content_type($wav_file);
-        $file_name = basename($wav_file);
+        // Set the subject of the email
+        $subject = $cid_name . ' - ' . $cid_num . ' - Voicemail Transcription';
 
-        // Create an email message with the .txt file content and the transcription output
+        // Message headers
         $headers = "From: $sender_name <$sender_email>\r\n";
         $headers .= "MIME-Version: 1.0\r\n";
-        $headers .= "Content-Type: multipart/mixed; boundary=\"BOUNDARY\"\r\n";
-        $subject = $txtData['callerid'];
+        $headers .= "Content-Type: multipart/mixed; boundary=\"$boundary\"\r\n";
 
-        $message = "--BOUNDARY\r\n";
-        $message .= "Content-Type: text/plain; charset=us-ascii\r\n";
-        $message .= "Content-Disposition: inline\r\n";
-        $message .= "\r\n";
-        $message .= "$transcription_output\r\n";
-        $message .= "\r\n";
+        // Message body
+        $body = "--$boundary\r\n";
+        $body .= "Content-Type: text/plain; charset=us-ascii\r\n";
+        $body .= "Content-Disposition: inline\r\n";
+        $body .= "\r\n";
+        $body .= "Name: $cid_name\r\n";
+        $body .= "Number: $cid_num\r\n";
+        $body .= "\r\n";
+        $body .= "$transcription_output\r\n";
+        $body .= "\r\n";
 
-        // Add the .wav file to the email
-        $message .= "--BOUNDARY\r\n";
-        $message .= "Content-Type: $file_type; name=\"$file_name\"\r\n";
-        $message .= "Content-Transfer-Encoding: base64\r\n";
-        $message .= "Content-Disposition: attachment; filename=\"$file_name\"\r\n";
-        $message .= "\r\n";
-        $message .= "$wav_base64\r\n";
-        $message .= "\r\n";
-        $message .= "--BOUNDARY--";
+        // Add wav file
+        $body .= "--$boundary\r\n";
+        $body .= "Content-Type: audio/wav; name=\"" . basename($wav_file) . "\"\r\n";
+        $body .= "Content-Transfer-Encoding: base64\r\n";
+        $body .= "Content-Disposition: attachment; filename=\"" . basename($wav_file) . "\"\r\n\r\n";
+        $body .= chunk_split(base64_encode($wavFileContent));
+
+        // Add txt file
+        $body .= "--$boundary\r\n";
+        $body .= "Content-Type: text/plain; name=\"" . basename($txt_file) . "\"\r\n";
+        $body .= "Content-Transfer-Encoding: base64\r\n";
+        $body .= "Content-Disposition: attachment; filename=\"" . basename($txt_file) . "\"\r\n\r\n";
+        $body .= chunk_split(base64_encode($txtFileContent));
+
+        // End of message
+        $body .= "--$boundary--";
 
         // Send the email
-        mail($email, $subject, $message, $headers);
+        if (mail($email, $subject, $body, $headers)) {
+            echo 'Message sent!\n';
+        } else {
+            echo 'Mailer Error.\n';
+        }
 
         // Exit the child process
         exit;
     }
 }
 
+// Check if there are any arguments
+if ($argc > 1) {
+    // Print each argument
+    for ($i = 1; $i < $argc; $i++) {
+        echo "Argument $i: $argv[$i]\n";
+    }
+} else {
+    echo "Please provide config: <php voicemail.php config.php>.\n";
+    exit;
+}
 
-$directory = "/var/spool/asterisk/voicemail/default/3520/INBOX";
-$destDirectory = "/var/spool/asterisk/voicemail/default/3520/PROCESSED";
-$sender_email = "someone@somewhere.net";
-$email = "someone_else@somewhere.com";
-$sender_name = "Asterisk Voicemail";
+$config_file = $argv[1];
+
+if (!file_exists($config_file)) {
+    echo "Error: Configuration file does not exist.\n";
+    exit;
+}
+
+require $config_file;
 
 // Start an infinite loop to continuously monitor the directory
 while (true) {
@@ -150,10 +190,26 @@ while (true) {
                 if (preg_match($pattern, $txtData['callerid'], $matches)) {
                     // Extracted number will be in the first capturing group
                     $extractedNumber = $matches[1];
-                    echo "Extracted Number: $extractedNumber";
+                    echo "Extracted Number: $extractedNumber\n";
                 } else {
-                    echo "No match found.";
+                    echo "No match found.\n";
                 }
+
+                // Regular expression pattern to match the text before the <
+                $pattern = '/(.*?)</';
+
+                // Perform the regular expression match
+                if (preg_match($pattern, $txtData['callerid'], $matches)) {
+                    // Extracted text will be in the first capturing group
+                    $extractedText = trim($matches[1]);
+                    echo "Extracted Text: $extractedText\n";
+                } else {
+                    echo "No match found.\n";
+                }
+
+                // set cid_name and cid_num
+                $cid_name = $extractedText;
+                $cid_num = $extractedNumber;
 
                 // Print a message indicating that a .txt file is found and append it to the email
                 echo "A .txt file is found: $txt_file\n";
@@ -168,20 +224,20 @@ while (true) {
 
                 // Move the file
                 if (rename($sourceWavFile, $destinationWavFile)) {
-                    echo "File moved successfully.";
+                    echo "File moved successfully. $sourceWavFile, $destinationWavFile\n";
                 } else {
-                    echo "Error: File could not be moved.";
+                    echo "Error: File could not be moved.\n";
                 }
 
                 // Move the file
                 if (rename($sourceTxtFile, $destinationTxtFile)) {
-                    echo "File moved successfully.";
+                    echo "File moved successfully. $sourceTxtFile, $destinationTxtFile\n";
                 } else {
-                    echo "Error: File could not be moved.";
+                    echo "Error: File could not be moved.\n";
                 }
 
                 // Process the file and send the email in a separate process
-                processFile($destinationWavFile, $destinationTxtFile, $sender_email, $sender_name, $email, $txtData);
+                processFile($destinationWavFile, $destinationTxtFile, $sender_email, $sender_name, $email, $cid_name, $cid_num);
             }
         }
     }
