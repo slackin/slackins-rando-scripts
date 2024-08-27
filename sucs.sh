@@ -1,10 +1,18 @@
 #!/bin/bash
 
+############################################
 # Slackin's UrbanTerror Colorizing Script
 # Version 1.0
 # Author: Slackin
 # Date: 2024-08-26
 # Usage: ./sucs.sh UrbanTerrorExecutable.x86_64
+# Description: This script colorizes the output of UrbanTerror.
+#              It takes the UrbanTerror executable as an argument.
+#              The script checks if the executable exists, is a file,
+#              is executable, and is a 64-bit executable.
+#              The script then runs the executable and processes the
+#              output to colorize it.
+#              The script uses ANSI escape codes to colorize the output.
 ############################################
 
 # Check if UrbanTerror executable is provided
