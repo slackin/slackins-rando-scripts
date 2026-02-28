@@ -1,463 +1,426 @@
 #!/bin/bash
+# ==============================================================================
+# slack-therm.sh — ncurses-style system thermal / fan / CPU frequency monitor
+# Uses tput (terminfo) for cursor addressing, color, and box-drawing.
+# Press 'q' or Ctrl-C to exit cleanly.
+# ==============================================================================
 
-MOBO_HWMON="hwmon2"
-CPU_HWMON="hwmon1"
-NVME_HWMON="hwmon0"
+# ──── Load configuration ─────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONF_FILE="${SCRIPT_DIR}/slack-therm.conf"
 
-############# CONFIG START ################
+if [[ ! -f "$CONF_FILE" ]]; then
+	echo "ERROR: Configuration file not found: ${CONF_FILE}"
+	echo "Run slack-therm-setup.sh to create one, or copy the example config."
+	exit 1
+fi
 
-TEMP_RAW_LOC[0]="/sys/class/hwmon/${CPU_HWMON}/temp1_input"
-TEMP_RAW_DIV[0]="1000"
-TEMP_COOL[0]="55"
-TEMP_WARM[0]="60"
-TEMP_HOT[0]="65"
-TEMP_DOWN[0]="84"
-TEMP_UP[0]="70"
-TEMP_LABEL[0]="Core"
+# shellcheck source=slack-therm.conf
+source "$CONF_FILE"
 
-TEMP_RAW_LOC[1]="/sys/class/hwmon/${CPU_HWMON}/temp3_input"
-TEMP_RAW_DIV[1]="1000"
-TEMP_COOL[1]="55"
-TEMP_WARM[1]="65"
-TEMP_HOT[1]="75"
-TEMP_DOWN[1]="75"
-TEMP_UP[1]="60"
-TEMP_LABEL[1]="| CCD"
+# ──── Unicode box-drawing characters ─────────────────────────────────────────
+BOX_TL="┌"
+BOX_TR="┐"
+BOX_BL="└"
+BOX_BR="┘"
+BOX_H="─"
+BOX_V="│"
+BOX_LT="├"
+BOX_RT="┤"
 
-TEMP_RAW_LOC[2]="/sys/class/hwmon/${MOBO_HWMON}/temp8_input"
-TEMP_RAW_DIV[2]="1000"
-TEMP_COOL[2]="55"
-TEMP_WARM[2]="65"
-TEMP_HOT[2]="75"
-TEMP_DOWN[2]="80"
-TEMP_UP[2]="60"
-TEMP_LABEL[2]="| CPU"
+# ──── tput color helpers ─────────────────────────────────────────────────────
+C_RESET="$(tput sgr0)"
+C_BOLD="$(tput bold)"
+C_BLUE="${C_BOLD}$(tput setaf 4)"
+C_GREEN="${C_BOLD}$(tput setaf 2)"
+C_YELLOW="${C_BOLD}$(tput setaf 3)"
+C_RED="${C_BOLD}$(tput setaf 1)"
+C_WHITE="${C_BOLD}$(tput setaf 7)"
+C_CYAN="${C_BOLD}$(tput setaf 6)"
+C_DIM="$(tput dim)"
 
-TEMP_RAW_LOC[3]="/sys/class/hwmon/${MOBO_HWMON}/temp1_input"
-TEMP_RAW_DIV[3]="1000"
-TEMP_COOL[3]="40"
-TEMP_WARM[3]="45"
-TEMP_HOT[3]="55"
-TEMP_DOWN[3]="50"
-TEMP_UP[3]="45"
-TEMP_LABEL[3]="| System"
+# ──── Terminal state management ──────────────────────────────────────────────
+PANEL_WIDTH=68
 
-TEMP_RAW_LOC[4]="/sys/class/hwmon/${NVME_HWMON}/temp1_input"
-TEMP_RAW_DIV[4]="1000"
-TEMP_COOL[4]="55"
-TEMP_WARM[4]="60"
-TEMP_HOT[4]="65"
-TEMP_LABEL[4]="NVMe"
+function cleanup() {
+	tput cnorm          # restore cursor
+	tput rmcup          # restore saved screen
+	tput sgr0           # reset attributes
+	stty echo           # restore echo
+	exit 0
+}
+trap cleanup EXIT INT TERM
 
-TEMP_RAW_LOC[5]="/sys/class/hwmon/${NVME_HWMON}/temp2_input"
-TEMP_RAW_DIV[5]="1000"
-TEMP_COOL[5]="55"
-TEMP_WARM[5]="60"
-TEMP_HOT[5]="65"
-TEMP_LABEL[5]="| SN1"
+tput smcup              # save screen & switch to alt buffer
+tput civis              # hide cursor
+stty -echo              # suppress keyboard echo
 
-TEMP_RAW_LOC[6]="/sys/class/hwmon/${NVME_HWMON}/temp3_input"
-TEMP_RAW_DIV[6]="1000"
-TEMP_COOL[6]="55"
-TEMP_WARM[6]="60"
-TEMP_HOT[6]="65"
-TEMP_LABEL[6]="| SN2"
+# ──── Detect CPU cores ───────────────────────────────────────────────────────
+NUM_CORES=0
+while [[ -e "/sys/devices/system/cpu/cpu${NUM_CORES}/cpufreq/scaling_cur_freq" ]]; do
+	(( NUM_CORES++ ))
+done
 
-FAN_RAW_LOC[0]="/sys/class/hwmon/${MOBO_HWMON}/fan1_input"
-FAN_LOW[0]="500"
-FAN_HIGH[0]="1800"
-FAN_LABEL[0]="CPU: "
+if (( NUM_CORES == 0 )); then
+	echo "ERROR: No CPU frequency scaling info found."
+	exit 1
+fi
 
-FAN_RAW_LOC[1]="/sys/class/hwmon/${MOBO_HWMON}/fan2_input"
-FAN_LOW[1]="500"
-FAN_HIGH[1]="2000"
-FAN_LABEL[1]="| Case: "
+# Pairing: if >8 cores and even, pair first half with second half (HT/SMT siblings)
+if (( NUM_CORES > 8 && NUM_CORES % 2 == 0 )); then
+	HALF_CORES=$(( NUM_CORES / 2 ))
+	PAIRED=1
+	FREQ_ROWS=$HALF_CORES
+else
+	PAIRED=0
+	FREQ_ROWS=$NUM_CORES
+fi
 
-FAN_RAW_LOC[2]="/sys/class/hwmon/${MOBO_HWMON}/fan3_input"
-FAN_LOW[2]="500"
-FAN_HIGH[2]="2000"
-FAN_LABEL[2]="| Front: "
+# Dynamic layout offsets (rows relative to ORIGIN_R)
+FREQ_START_OFF=10
+STATUS_OFF=$(( FREQ_START_OFF + FREQ_ROWS + 2 ))
+BOX_HEIGHT=$(( STATUS_OFF + 2 ))
 
-FAN_RAW_LOC[3]="/sys/class/hwmon/${MOBO_HWMON}/fan4_input"
-FAN_LOW[3]="500"
-FAN_HIGH[3]="2000"
-FAN_LABEL[3]="| "
+# ──── Drawing primitives ─────────────────────────────────────────────────────
 
-FAN_RAW_LOC[4]="/sys/class/hwmon/${MOBO_HWMON}/fan7_input"
-FAN_LOW[4]="500"
-FAN_HIGH[4]="2000"
-FAN_LABEL[4]="| "
+# draw_hline ROW COL WIDTH [CHAR]
+function draw_hline() {
+	local r=$1 c=$2 w=$3 ch="${4:-$BOX_H}"
+	tput cup "$r" "$c"
+	printf '%0.s'"$ch" $(seq 1 "$w")
+}
 
-SLEEP_TIME=3
+# draw_box ROW COL WIDTH HEIGHT [TITLE]
+function draw_box() {
+	local r=$1 c=$2 w=$3 h=$4 title="$5"
+	local inner=$((w - 2))
 
-FREQ_LOW="2200"
-FREQ_MID="3200"
-FREQ_HIGH="4000"
+	# top border
+	tput cup "$r" "$c"
+	printf "${C_CYAN}%s" "$BOX_TL"
+	printf '%0.s'"$BOX_H" $(seq 1 "$inner")
+	printf "%s${C_RESET}" "$BOX_TR"
 
-FREQ_RAW_DIV="1000"
+	# optional title
+	if [[ -n "$title" ]]; then
+		local tlen=${#title}
+		local tpos=$(( c + (w - tlen - 2) / 2 ))
+		tput cup "$r" "$tpos"
+		printf "${C_CYAN}${BOX_H} ${C_WHITE}%s${C_CYAN} ${BOX_H}${C_RESET}" "$title"
+	fi
 
-############### CONFIG END ################
+	# sides
+	for (( row = r + 1; row < r + h - 1; row++ )); do
+		tput cup "$row" "$c"
+		printf "${C_CYAN}%s${C_RESET}" "$BOX_V"
+		tput cup "$row" $(( c + w - 1 ))
+		printf "${C_CYAN}%s${C_RESET}" "$BOX_V"
+	done
 
+	# bottom border
+	tput cup $(( r + h - 1 )) "$c"
+	printf "${C_CYAN}%s" "$BOX_BL"
+	printf '%0.s'"$BOX_H" $(seq 1 "$inner")
+	printf "%s${C_RESET}" "$BOX_BR"
+}
+
+# draw_separator ROW COL WIDTH  — a mid-box horizontal rule
+function draw_separator() {
+	local r=$1 c=$2 w=$3
+	local inner=$((w - 2))
+	tput cup "$r" "$c"
+	printf "${C_CYAN}%s" "$BOX_LT"
+	printf '%0.s'"$BOX_H" $(seq 1 "$inner")
+	printf "%s${C_RESET}" "$BOX_RT"
+}
+
+# mvprint ROW COL TEXT — print at position (text may contain tput escapes)
+function mvprint() {
+	tput cup "$1" "$2"
+	shift 2
+	printf "%b" "$@"
+}
+
+# clear_field ROW COL WIDTH — blank a field for overwriting
+function clear_field() {
+	tput cup "$1" "$2"
+	printf "%-${3}s" ""
+}
+
+# ──── Color-value helpers (return via $CV_OUT) ───────────────────────────────
+CV_OUT=""
+
+function color_for_temp() {
+	local val=$1 cool=$2 warm=$3 hot=$4
+	if   (( val <= cool )); then CV_OUT="${C_BLUE}${val}°C${C_RESET}"
+	elif (( val <= warm )); then CV_OUT="${C_GREEN}${val}°C${C_RESET}"
+	elif (( val <= hot  )); then CV_OUT="${C_YELLOW}${val}°C${C_RESET}"
+	else                         CV_OUT="${C_RED}${val}°C${C_RESET}"
+	fi
+}
+
+function color_for_fan() {
+	local val=$1 lo=$2 hi=$3
+	if   (( val <= lo )); then CV_OUT="${C_RED}${val}${C_RESET}"
+	elif (( val <= hi )); then CV_OUT="${C_GREEN}${val}${C_RESET}"
+	else                       CV_OUT="${C_RED}${val}${C_RESET}"
+	fi
+}
+
+function color_for_freq() {
+	local val=$1
+	local fval
+	printf -v fval '%4d' "$val"
+	if   (( val <= FREQ_LOW  )); then CV_OUT="${C_BLUE}${fval}${C_RESET}"
+	elif (( val <= FREQ_MID  )); then CV_OUT="${C_GREEN}${fval}${C_RESET}"
+	elif (( val <= FREQ_HIGH )); then CV_OUT="${C_YELLOW}${fval}${C_RESET}"
+	else                              CV_OUT="${C_RED}${fval}${C_RESET}"
+	fi
+}
+
+function color_for_gov() {
+	local gov="$1"
+	case "$gov" in
+		ondemand)     CV_OUT="${C_GREEN}${gov}${C_RESET}" ;;
+		performance)  CV_OUT="${C_RED}${gov}${C_RESET}" ;;
+		powersave)    CV_OUT="${C_BLUE}${gov}${C_RESET}" ;;
+		userspace|conservative) CV_OUT="${C_YELLOW}${gov}${C_RESET}" ;;
+		*)            CV_OUT="${C_WHITE}${gov}${C_RESET}" ;;
+	esac
+}
+
+function color_for_state() {
+	local st=$1
+	case $st in
+		0) CV_OUT="${C_GREEN}${st}${C_RESET}" ;;
+		1) CV_OUT="${C_YELLOW}${st}${C_RESET}" ;;
+		*) CV_OUT="${C_RED}${st}${C_RESET}" ;;
+	esac
+}
+
+# ──── Throttle / cooling logic (unchanged from original) ─────────────────────
 core="0"
 ThorCount="0"
 ThorReset="0"
 
-# Get the raw temp, then divide it by value set in config, then colorize it.
-function GetRealTemp() {
-	TEMP_RAW[$i]=`cat ${TEMP_RAW_LOC[$i]}`
-	TEMP_REAL[$i]=$((${TEMP_RAW[$i]}/${TEMP_RAW_DIV[$i]}))
-	ColorizeTemp
-}
-
-# Get the raw freq, then divide it by value set in config, then colorize it.
-function GetRealFreq() {
-	FREQ_RAW[$c]=`cat ${FREQ_RAW_LOC[$c]}`
-	FREQ_REAL[$c]=$((${FREQ_RAW[$c]}/${FREQ_RAW_DIV}))
-	ColorizeFreq
-}
-
-# Get the governor and then colorize it.
-function GetGovernor() {
-	FREQ_GOV[$c]=`cat /sys/devices/system/cpu/cpu${c}/cpufreq/scaling_governor`
-	ColorizeGov
-}
-
-# Get the fan speed and then colorize it.
-function GetFanSpeed() {
-	FAN_SPEED[$f]=`cat ${FAN_RAW_LOC[$f]}`
-	ColorizeFan
-}
-
-# Get the current cooling state.
 function GetCoolingState() {
-	coolcore=$1
-	THERM_STATE[${coolcore}]=`cat ./${coolcore}cur_state_text.core`
-	ColorizeState
+	local coolcore=$1
+	THERM_STATE[${coolcore}]=$(cat ./${coolcore}cur_state_text.core 2>/dev/null || echo 0)
 }
 
 function GetSpeed() {
-	i=$1
-	GetCoolingState ${i}
-	if [ ${TEMP_REAL[$i]} -le ${TEMP_UP[$i]} ] ;
-	then
-		if [ ${THERM_STATE[$i]} -gt 0 ] ;
-		then
-		    SPEED=$((${THERM_STATE[$i]}-1))
-		    return ;
+	local idx=$1
+	GetCoolingState ${idx}
+	if (( TEMP_REAL[idx] <= TEMP_UP[idx] )); then
+		if (( THERM_STATE[idx] > 0 )); then
+			SPEED=$(( THERM_STATE[idx] - 1 )); return
 		fi
 	fi
-	if [ ${TEMP_REAL[$i]} -le ${TEMP_DOWN[$i]} -a ${TEMP_REAL[$i]} -gt ${TEMP_UP[$i]} ] ;
-	then
-		SPEED=${THERM_STATE[$i]}
-		return ;
+	if (( TEMP_REAL[idx] <= TEMP_DOWN[idx] && TEMP_REAL[idx] > TEMP_UP[idx] )); then
+		SPEED=${THERM_STATE[$idx]}; return
 	fi
-	if [ ${TEMP_REAL[$i]} -gt ${TEMP_DOWN[$i]} ] ;
-	then
-		if [ ${THERM_STATE[$i]} -le 3 ] ;
-		then
-		    SPEED=$((${THERM_STATE[$i]}+1))
-		    return ;
+	if (( TEMP_REAL[idx] > TEMP_DOWN[idx] )); then
+		if (( THERM_STATE[idx] <= 3 )); then
+			SPEED=$(( THERM_STATE[idx] + 1 )); return
 		fi
 	fi
 	SPEED=0
 }
 
 function CheckSpeed() {
-	cores=$1
-	if [ ${SPEED} -lt ${THERM_STATE[$cores]} -a ${THERM_STATE[$cores]} != 0 ] ;
-	then
-		NEW_STATE=$((${THERM_STATE[$cores]} - 1))
+	local cores=$1
+	if (( SPEED < THERM_STATE[cores] && THERM_STATE[cores] != 0 )); then
+		local NEW_STATE=$(( THERM_STATE[cores] - 1 ))
 		ThorCores ${NEW_STATE} ${cores}
 		echo ${NEW_STATE} > ./${cores}cur_state_text.core
-		if [ ${cores} != 0 -a ${NEW_STATE} == 0 ] ;
-		then
-			cores=$((${cores}-1)) ;
+		if (( cores != 0 && NEW_STATE == 0 )); then
+			cores=$(( cores - 1 ))
 		fi
-		return ;
+		return
 	fi
-	if [ ${SPEED} -gt ${THERM_STATE[$cores]} -a ${THERM_STATE[$cores]} != 4 ] ;
-	then
-		NEW_STATE=$((${THERM_STATE[$cores]} + 1))
-		if [ ${NEW_STATE} == 4 -a ${cores} != 4 ] ;
-		then
-			cores=$((${cores}+1))
-			NEW_STATE="1" ;
+	if (( SPEED > THERM_STATE[cores] && THERM_STATE[cores] != 4 )); then
+		local NEW_STATE=$(( THERM_STATE[cores] + 1 ))
+		if (( NEW_STATE == 4 && cores != 4 )); then
+			cores=$(( cores + 1 ))
+			NEW_STATE=1
 		fi
 		ThorCores ${NEW_STATE} ${cores}
 		echo ${NEW_STATE} > ./${cores}cur_state_text.core
-		return ;
+		return
 	fi
 }
 
 function ThorCores() {
 	case $1 in
-	    0)
-		echo 1 > /sys/devices/system/cpu/cpufreq/boost
-		;;
-	    1)
-		max_freq="3600000"
-		echo $max_freq > /sys/devices/system/cpu/cpu$2/cpufreq/scaling_max_freq
-		echo 0 > /sys/devices/system/cpu/cpufreq/boost
-		;;
-	    2)
-		max_freq="2800000"
-		echo $max_freq > /sys/devices/system/cpu/cpu$2/cpufreq/scaling_max_freq
-		;;
-	    3)
-		max_freq="2200000"
-		echo $max_freq > /sys/devices/system/cpu/cpu$2/cpufreq/scaling_max_freq
-		;;
-	    *)
-		max_freq="2200000"
-		echo $max_freq > /sys/devices/system/cpu/cpu$2/cpufreq/scaling_max_freq
-		;;
-	esac
-
-}
-
-# Function for colorizing a string.
-function ColorizeStr() {
-
-	# Case statement to set ascii color code from named color
-	case "$1" in
-		"blue" )
-			color="\e[1;34m"
-			;;
-		"red" )
-			color="\e[1;37;31m"
-			;;
-		"yellow" )
-			color="\e[1;33m"
-			;;
-		"green" )
-			color="\e[1;32m"
-			;;
-	esac
- 
-	# Do the actual echo, note the -e to use the escape codes
-	# and notice the color reset at the end, always use that.
-	CL_STR="${color}${2}\e[0m"
-	
-}
-
-# Function to colorize the cooling state value.
-function ColorizeState() {
-	case ${THERM_STATE[$c]} in 
-		"0" )
-			ColorizeStr "green" ${THERM_STATE[$c]}
-			STATE_STR[$c]=${CL_STR}
-		;;
-		"1" )
-			ColorizeStr "yellow" ${THERM_STATE[$c]}
-			STATE_STR[$c]=${CL_STR}
-		;;
-		"2" )
-			ColorizeStr "red" ${THERM_STATE[$c]}
-			STATE_STR[$c]=${CL_STR}
-		;;
+		0) echo 1 > /sys/devices/system/cpu/cpufreq/boost ;;
+		1) echo 3600000 > /sys/devices/system/cpu/cpu$2/cpufreq/scaling_max_freq
+		   echo 0 > /sys/devices/system/cpu/cpufreq/boost ;;
+		2) echo 2800000 > /sys/devices/system/cpu/cpu$2/cpufreq/scaling_max_freq ;;
+		3) echo 2200000 > /sys/devices/system/cpu/cpu$2/cpufreq/scaling_max_freq ;;
+		*) echo 2200000 > /sys/devices/system/cpu/cpu$2/cpufreq/scaling_max_freq ;;
 	esac
 }
 
-# Function to colorize the governor value.
-function ColorizeGov() {
-	case ${FREQ_GOV[$c]} in 
-		"ondemand" )
-			ColorizeStr "green" ${FREQ_GOV[$c]}
-			GOV_STR[$c]=${CL_STR}
-		;;
-		"performance" )
-			ColorizeStr "red" ${FREQ_GOV[$c]}
-			GOV_STR[$c]=${CL_STR}
-		;;
-		"powersave" )
-			ColorizeStr "blue" ${FREQ_GOV[$c]}
-			GOV_STR[$c]=${CL_STR}
-		;;
-		"userspace" )
-			ColorizeStr "yellow" ${FREQ_GOV[$c]}
-			GOV_STR[$c]=${CL_STR}
-		;;
-		"conservative" )
-			ColorizeStr "yellow" ${FREQ_GOV[$c]}
-			GOV_STR[$c]=${CL_STR}
-		;;
-	esac
-}
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN LOOP
+# ══════════════════════════════════════════════════════════════════════════════
 
-# Function to colorize the temp.
-function ColorizeTemp() {
-	if [ ${TEMP_REAL[$i]} -le ${TEMP_COOL[$i]} ] ;
-	then
-		ColorizeStr "blue" ${TEMP_REAL[$i]}
-		TEMP_STR[$i]=${CL_STR}
-		return ;
-	fi
-	if [ ${TEMP_REAL[$i]} -gt ${TEMP_COOL[$i]} -a ${TEMP_REAL[$i]} -le ${TEMP_WARM[$i]} ] ;
-	then
-		ColorizeStr "green" ${TEMP_REAL[$i]}
-		TEMP_STR[$i]=${CL_STR}
-		return ;
-	fi
-	if [ ${TEMP_REAL[$i]} -gt ${TEMP_WARM[$i]} -a ${TEMP_REAL[$i]} -le ${TEMP_HOT[$i]} ] ;
-	then
-		ColorizeStr "yellow" ${TEMP_REAL[$i]}
-		TEMP_STR[$i]=${CL_STR}
-		return ;
-	fi
-	if [ ${TEMP_REAL[$i]} -gt ${TEMP_HOT[$i]} ] ;
-	then
-		ColorizeStr "red" ${TEMP_REAL[$i]}
-		TEMP_STR[$i]=${CL_STR}
-		return ;
-	fi
-}
-	
-# Function to colorize the temp.
-function ColorizeFan() {
-	if [ ${FAN_SPEED[$f]} -le ${FAN_LOW[$f]} ] ;
-	then
-		ColorizeStr "red" ${FAN_SPEED[$f]}
-		FAN_STR[$f]=${CL_STR}
-		return ;
-	fi
-	if [ ${FAN_SPEED[$f]} -le ${FAN_HIGH[$f]} -a ${FAN_SPEED[$f]} -gt ${FAN_LOW[$f]} ] ;
-	then
-		ColorizeStr "green" ${FAN_SPEED[$f]}
-		FAN_STR[$f]=${CL_STR}
-		return ;
-	fi
-	if [ ${FAN_SPEED[$f]} -gt ${FAN_HIGH[$f]} ] ;
-	then
-		ColorizeStr "red" ${FAN_SPEED[$f]}
-		FAN_STR[$f]=${CL_STR}
-		return ;
-	fi
-}
+# Layout constants — all relative to origin (1,1) leaving a 1-cell margin
+ORIGIN_R=1
+ORIGIN_C=2
 
-# Function to colorize the frequency.
-function ColorizeFreq() {
-	if [ ${FREQ_REAL[$c]} -le ${FREQ_LOW} ] ;
-	then
-		ColorizeStr "blue" ${FREQ_REAL[$c]}
-		FREQ_STR[$c]=${CL_STR}
-		return ;
-	fi
-	if [ ${FREQ_REAL[$c]} -gt ${FREQ_LOW} -a ${FREQ_REAL[$c]} -le ${FREQ_MID} ] ;
-	then
-		ColorizeStr "green" ${FREQ_REAL[$c]}
-		FREQ_STR[$c]=${CL_STR}
-		return ;
-	fi
-	if [ ${FREQ_REAL[$c]} -gt ${FREQ_MID} -a ${FREQ_REAL[$c]} -le ${FREQ_HIGH} ] ;
-	then
-		ColorizeStr "yellow" ${FREQ_REAL[$c]}
-		FREQ_STR[$c]=${CL_STR}
-		return ;
-	fi
-	if [ ${FREQ_REAL[$c]} -gt ${FREQ_HIGH} ] ;
-	then
-		ColorizeStr "red" ${FREQ_REAL[$c]}
-		FREQ_STR[$c]=${CL_STR}
-		return ;
-	fi
-}
+first_draw=1
 
-# Start of program loop.
-while [ TRUE ]
-do
+while true; do
+	# ── Detect terminal size and centre the panel ──
+	TERM_ROWS=$(tput lines)
+	TERM_COLS=$(tput cols)
+	ORIGIN_R=$(( (TERM_ROWS - BOX_HEIGHT) / 2 ))
+	ORIGIN_C=$(( (TERM_COLS - PANEL_WIDTH) / 2 ))
+	(( ORIGIN_R < 0 )) && ORIGIN_R=0
+	(( ORIGIN_C < 0 )) && ORIGIN_C=0
 
-	# Loop for gathering CPU temp sensor information.
-	for i in {0..3} ;
-	do 
-		#echo -e ${i}
-		if [ -z ${TEMP_RAW_LOC[$i]} ] ;
-		then
-			break ;
+	# ── Outer box (drawn once, or on resize) ──
+	if (( first_draw )); then
+		tput clear
+		draw_box $ORIGIN_R $ORIGIN_C $PANEL_WIDTH $BOX_HEIGHT "System Monitor"
+
+		# Section headers
+		row=$(( ORIGIN_R + 1 ))
+		draw_separator $(( ORIGIN_R + 3 )) $ORIGIN_C $PANEL_WIDTH
+		mvprint $(( ORIGIN_R + 1 )) $(( ORIGIN_C + 2 )) "${C_WHITE} CPU / Board Temps${C_RESET}"
+		draw_separator $(( ORIGIN_R + 5 )) $ORIGIN_C $PANEL_WIDTH
+		mvprint $(( ORIGIN_R + 4 )) $(( ORIGIN_C + 2 )) "${C_WHITE} NVMe Temps${C_RESET}"
+		draw_separator $(( ORIGIN_R + 7 )) $ORIGIN_C $PANEL_WIDTH
+		mvprint $(( ORIGIN_R + 6 )) $(( ORIGIN_C + 2 )) "${C_WHITE} Fan Speeds  ${C_DIM}(RPM)${C_RESET}"
+		draw_separator $(( ORIGIN_R + 9 )) $ORIGIN_C $PANEL_WIDTH
+		mvprint $(( ORIGIN_R + 8 )) $(( ORIGIN_C + 2 )) "${C_WHITE} CPU Freq / Governor${C_RESET}"
+
+		# Footer
+		mvprint $(( ORIGIN_R + BOX_HEIGHT )) $(( ORIGIN_C )) \
+			"${C_DIM}  Press 'q' to quit  │  Refresh: ${SLEEP_TIME}s${C_RESET}"
+		first_draw=0
+	fi
+
+	# ──────────── Gather & display: CPU / Board temps ────────────
+	ROW=$(( ORIGIN_R + 2 ))
+	COL=$(( ORIGIN_C + 3 ))
+	clear_field $ROW $COL $(( PANEL_WIDTH - 4 ))
+	tput cup $ROW $COL
+	for i in {0..3}; do
+		[[ -z "${TEMP_RAW_LOC[$i]}" ]] && break
+		TEMP_RAW[$i]=$(cat "${TEMP_RAW_LOC[$i]}" 2>/dev/null || echo 0)
+		TEMP_REAL[$i]=$(( TEMP_RAW[i] / TEMP_RAW_DIV[i] ))
+		color_for_temp ${TEMP_REAL[$i]} ${TEMP_COOL[$i]} ${TEMP_WARM[$i]} ${TEMP_HOT[$i]}
+		printf " ${C_WHITE}%-6s${C_RESET} %b " "${TEMP_LABEL[$i]}" "$CV_OUT"
+		# Throttle logic for Core
+		if [[ "${TEMP_LABEL[$i]}" == "Core" ]]; then
+			GetSpeed $i
 		fi
-		GetRealTemp
-		if [ "${TEMP_LABEL[$i]}" == "Core" ] ;
-		then
-			GetSpeed $i ;
-		fi
-		TEMP_OUT="${TEMP_OUT}\e[1;37m ${TEMP_LABEL[$i]}: ${TEMP_STR[$i]}\e[1;37mc\e[0m"
 	done
 
-	# Loop for gathering NVMe temp sensor information.
-	for i in {4..6} ;
-	do 
-		#echo -e ${TEMP_RAW_LOC[$i]}
-		if [ -z ${TEMP_RAW_LOC[$i]} ] ;
-		then
-			break ;
-		fi
-		GetRealTemp
-		NVME_OUT="${NVME_OUT}\e[1;37m ${TEMP_LABEL[$i]}: ${TEMP_STR[$i]}\e[1;37mc\e[0m"
+	# ──────────── Gather & display: NVMe temps ───────────────────
+	ROW=$(( ORIGIN_R + 4 + 1 ))
+	COL=$(( ORIGIN_C + 3 ))
+	clear_field $(( ORIGIN_R + 5 - 1 )) $COL $(( PANEL_WIDTH - 4 ))
+	tput cup $(( ORIGIN_R + 5 - 1 )) $COL
+	for i in {4..6}; do
+		[[ -z "${TEMP_RAW_LOC[$i]}" ]] && break
+		TEMP_RAW[$i]=$(cat "${TEMP_RAW_LOC[$i]}" 2>/dev/null || echo 0)
+		TEMP_REAL[$i]=$(( TEMP_RAW[i] / TEMP_RAW_DIV[i] ))
+		color_for_temp ${TEMP_REAL[$i]} ${TEMP_COOL[$i]} ${TEMP_WARM[$i]} ${TEMP_HOT[$i]}
+		printf " ${C_WHITE}%-5s${C_RESET} %b " "${TEMP_LABEL[$i]}" "$CV_OUT"
 	done
 
-	# Loop for gathering fan information.
-	for f in {0..7} ;
-	do 
-		if [ -z ${FAN_RAW_LOC[$f]} ] ;
-		then
-			break ;
-		fi
-		GetFanSpeed
-		FAN_OUT="${FAN_OUT}\e[1;37m ${FAN_LABEL[$f]}${FAN_STR[$f]}\e[1;37m\e[0m"
+	# ──────────── Gather & display: Fan speeds ───────────────────
+	ROW=$(( ORIGIN_R + 6 + 1 ))
+	clear_field $(( ORIGIN_R + 7 - 1 )) $COL $(( PANEL_WIDTH - 4 ))
+	tput cup $(( ORIGIN_R + 7 - 1 )) $COL
+	for f in {0..7}; do
+		[[ -z "${FAN_RAW_LOC[$f]}" ]] && break
+		FAN_SPEED[$f]=$(cat "${FAN_RAW_LOC[$f]}" 2>/dev/null || echo 0)
+		color_for_fan ${FAN_SPEED[$f]} ${FAN_LOW[$f]} ${FAN_HIGH[$f]}
+		printf " ${C_WHITE}%-5s${C_RESET} %b " "${FAN_LABEL[$f]}" "$CV_OUT"
 	done
 
-	# Loop for gathering cpufreq information.
-	for c in {0..15} ;
-	do
+	# ──────────── Gather & display: CPU Freq / Governor ──────────
+	ROW=$(( ORIGIN_R + 10 ))
+	# Gather data for all cores
+	for (( c = 0; c < NUM_CORES; c++ )); do
 		FREQ_RAW_LOC[$c]="/sys/devices/system/cpu/cpu${c}/cpufreq/scaling_cur_freq"
-		if [ ! -e ${FREQ_RAW_LOC[$c]} ] ;
-		then
-			break ;
-		fi
-		GetGovernor
-		GetRealFreq
+		FREQ_RAW[$c]=$(cat "${FREQ_RAW_LOC[$c]}" 2>/dev/null || echo 0)
+		FREQ_REAL[$c]=$(( FREQ_RAW[c] / FREQ_RAW_DIV ))
+		FREQ_GOV[$c]=$(cat "/sys/devices/system/cpu/cpu${c}/cpufreq/scaling_governor" 2>/dev/null || echo "?")
 		GetCoolingState ${c}
-		if [ $ThorCount -eq 5 ] ;
-		then
-		    CheckSpeed ${c}
-		    ThorReset="1"
+		if (( ThorCount == 5 )); then
+			CheckSpeed ${c}
+			ThorReset=1
 		fi
 	done
 
-	for j in {0..7} ;
-	do
-		k=$((j + 8))
-		if [ $k -eq 8 -o $k -eq 9 ] ;
-		then
-		    k_out="$j-$k "
-		else
-		    k_out="$j-$k"
-		fi
-		FREQ_OUT[$j]="\e[1;37m Core\e[0m:\e[1;32m$k_out\e[1;37m\e[0m \e[1;37m|\e[0m ${FREQ_STR[$j]}-${FREQ_STR[$k]}\e[1;37mMhz |\e[0m ${STATE_STR[$j]}/${STATE_STR[$k]} ${GOV_STR[$j]}\e[0m"
-	done
-	### Start output
-	
-	echo "<=============================================>"
-	echo -e ${TEMP_OUT}
-	echo -e ${NVME_OUT}
-	echo -e ${FAN_OUT}
+	# Display CPU frequency rows (paired or individual based on detected cores)
+	if (( PAIRED )); then
+		for (( j = 0; j < HALF_CORES; j++ )); do
+			k=$(( j + HALF_CORES ))
+			clear_field $(( ROW + j )) $(( ORIGIN_C + 2 )) $(( PANEL_WIDTH - 3 ))
+			tput cup $(( ROW + j )) $(( ORIGIN_C + 2 ))
 
-	# Loop for cpufreq output.
-	for OUT in "${FREQ_OUT[@]}" ;
-	do
-		echo -e ${OUT}
-	done
-	
-	# Clear TEMP_OUT var
-	if [ $ThorReset -eq 1 ] ;
-	then
-	    ThorCount="0"
-	    ThorReset="0"
+			# Core pair label
+			printf " ${C_WHITE}Core ${C_GREEN}%d-%d${C_RESET} " "$j" "$k"
+
+			# Frequencies
+			color_for_freq ${FREQ_REAL[$j]:-0}; f1="$CV_OUT"
+			color_for_freq ${FREQ_REAL[$k]:-0}; f2="$CV_OUT"
+			printf "${C_DIM}│${C_RESET} %b-%b ${C_WHITE}MHz${C_RESET}" "$f1" "$f2"
+
+			# Cooling state
+			color_for_state ${THERM_STATE[$j]:-0}; s1="$CV_OUT"
+			color_for_state ${THERM_STATE[$k]:-0}; s2="$CV_OUT"
+			printf " ${C_DIM}│${C_RESET} %b/%b" "$s1" "$s2"
+
+			# Governor
+			color_for_gov "${FREQ_GOV[$j]:-?}"
+			printf " %b" "$CV_OUT"
+		done
 	else
-	    ((ThorCount++))
+		for (( j = 0; j < NUM_CORES; j++ )); do
+			clear_field $(( ROW + j )) $(( ORIGIN_C + 2 )) $(( PANEL_WIDTH - 3 ))
+			tput cup $(( ROW + j )) $(( ORIGIN_C + 2 ))
+
+			# Core label
+			printf " ${C_WHITE}Core ${C_GREEN}%d${C_RESET}  " "$j"
+
+			# Frequency
+			color_for_freq ${FREQ_REAL[$j]:-0}
+			printf "${C_DIM}│${C_RESET} %b ${C_WHITE}MHz${C_RESET}" "$CV_OUT"
+
+			# Cooling state
+			color_for_state ${THERM_STATE[$j]:-0}
+			printf " ${C_DIM}│${C_RESET} %b" "$CV_OUT"
+
+			# Governor
+			color_for_gov "${FREQ_GOV[$j]:-?}"
+			printf " %b" "$CV_OUT"
+		done
 	fi
-	TEMP_OUT=""
-	FAN_OUT=""
-	NVME_OUT=""
-	# Sleep for time set in config.
-	sleep $SLEEP_TIME
+
+	# ──────────── Bottom status line ─────────────────────────────
+	mvprint $(( ORIGIN_R + STATUS_OFF )) $(( ORIGIN_C + 2 )) \
+		"${C_DIM}  Last update: $(date '+%H:%M:%S')    Thor: ${ThorCount}/5${C_RESET}          "
+
+	# ──────────── Throttle bookkeeping ───────────────────────────
+	if (( ThorReset == 1 )); then
+		ThorCount=0
+		ThorReset=0
+	else
+		(( ThorCount++ ))
+	fi
+
+	# ──────────── Wait for SLEEP_TIME, but check for 'q' key ────
+	for (( _t = 0; _t < SLEEP_TIME * 10; _t++ )); do
+		read -rsn1 -t 0.1 key 2>/dev/null
+		if [[ "$key" == "q" || "$key" == "Q" ]]; then
+			cleanup
+		fi
+	done
 done
